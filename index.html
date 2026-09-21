@@ -1040,7 +1040,61 @@ kbd {
     transition-duration: .001ms !important;
   }
 }
+
+/* 동기화 상태 칩 */
+.sync-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--muted);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: -.2px;
+  white-space: nowrap;
+  cursor: default;
+  user-select: none;
+  transition: color .2s var(--ease), background .2s var(--ease), border-color .2s var(--ease);
+}
+.sync-chip .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+.sync-chip[data-state="busy"] {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: rgba(var(--accent-rgb), .25);
+}
+.sync-chip[data-state="busy"] .dot { animation: syncPulse 1s ease-in-out infinite; }
+.sync-chip[data-state="ok"] {
+  color: var(--income);
+  background: var(--income-soft);
+  border-color: rgba(var(--income-rgb), .25);
+}
+.sync-chip[data-state="error"] {
+  color: var(--expense);
+  background: var(--expense-soft);
+  border-color: rgba(var(--expense-rgb), .3);
+  cursor: pointer;
+}
+@keyframes syncPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: .3; transform: scale(.7); }
+}
+@media (max-width: 560px) {
+  .sync-chip { padding: 0 10px; }
+  .sync-chip .txt { display: none; }
+}
 </style>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.js"></script>
 </head>
 <body>
 <div class="orbs" aria-hidden="true"><i></i><i></i><i></i></div>
@@ -1055,10 +1109,15 @@ kbd {
       </div>
     </div>
     <div class="topbar-actions">
+      <button class="sync-chip" id="syncChip" type="button" data-state="busy" aria-live="polite">
+        <i class="dot" aria-hidden="true"></i><span class="txt" id="syncText">연결 중</span>
+      </button>
       <button class="icon-btn" id="themeBtn" title="테마 전환 (T)" aria-label="테마 전환">🌙</button>
       <div class="menu-wrap">
         <button class="icon-btn" id="menuBtn" title="더보기" aria-label="더보기 메뉴" aria-haspopup="true" aria-expanded="false">⋯</button>
         <div class="menu" id="menu" role="menu">
+          <button data-act="reload" role="menuitem">🔄 서버에서 새로고침</button>
+          <hr>
           <button data-act="csv" role="menuitem">📄 CSV로 내보내기</button>
           <button data-act="backup" role="menuitem">💾 백업 파일 저장</button>
           <button data-act="restore" role="menuitem">📥 백업 불러오기</button>
@@ -1257,9 +1316,15 @@ kbd {
   /* ==========================================================
      상수 · 유틸
      ========================================================== */
-  var K_TX = "gagyebu_transactions_v1";
-  var K_SET = "gagyebu_settings_v1";
-  var K_BUD = "gagyebu_budgets_v1";
+  /* 가계부 데이터(내역·예산·기본 예산)는 모두 Supabase 테이블에 저장한다.
+     테마만 기기별 화면 설정이라 로컬에 남긴다. */
+  var SUPABASE_URL = "https://dipkkqlnxzbjwayatsaj.supabase.co";
+  var SUPABASE_ANON_KEY = "sb_publishable_yyLfpb5qm72qvxT5YPiNAA_tf7wX5hD";
+
+  var K_PREF = "gagyebu_settings_v1";   // { theme } — 기기별 화면 설정
+  var K_OLD_TX = "gagyebu_transactions_v1";   // 예전 로컬 저장분 (1회 이전용)
+  var K_OLD_BUD = "gagyebu_budgets_v1";
+  var K_MIGRATED = "gagyebu_supabase_migrated_v1";
 
   var CATS = {
     expense: [
@@ -1347,14 +1412,27 @@ kbd {
     try { localStorage.setItem(key, JSON.stringify(val)); } catch (e) { /* 저장 불가: 세션 동안만 유지 */ }
   }
 
+  function safeGetRaw(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+
+  function safeSetRaw(key, val) {
+    try { localStorage.setItem(key, val); } catch (e) { /* 무시 */ }
+  }
+
   /* ==========================================================
      상태
      ========================================================== */
   var now = new Date();
+  var storedPrefs = safeGet(K_PREF, {});
+  var prefs = { theme: storedPrefs && storedPrefs.theme ? storedPrefs.theme : null };
+  // 예전 설정에 들어 있던 기본 예산 (이전 작업에서만 사용)
+  var legacyDefaultBudget = Number(storedPrefs && storedPrefs.defaultBudget) || 0;
   var state = {
-    tx: normalize(safeGet(K_TX, [])),
-    settings: Object.assign({ theme: null, defaultBudget: 0 }, safeGet(K_SET, {})),
-    budgets: safeGet(K_BUD, {}),
+    tx: [],
+    settings: { defaultBudget: 0 },
+    budgets: {},
+    loading: true,
     view: { y: now.getFullYear(), m: now.getMonth() },
     filter: "all",
     query: "",
@@ -1382,9 +1460,236 @@ kbd {
     });
   }
 
-  function saveTx() { safeSet(K_TX, state.tx); }
-  function saveSettings() { safeSet(K_SET, state.settings); }
-  function saveBudgets() { safeSet(K_BUD, state.budgets); }
+  /* ==========================================================
+     Supabase 데이터 계층
+     ---------------------------------------------------------
+     테이블: transactions(id,type,date,category,memo,amount)
+            budgets(month,amount) / settings(id=1,default_budget)
+     화면은 먼저 낙관적으로 갱신하고, 서버 반영이 실패하면
+     토스트로 알린 뒤 서버 상태를 다시 내려받아 되돌린다.
+     ========================================================== */
+  var sb = null;
+  var sbError = null;
+  try {
+    if (window.supabase && window.supabase.createClient) {
+      sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false }
+      });
+    } else {
+      sbError = "supabase-js를 불러오지 못했어요";
+    }
+  } catch (e) {
+    sbError = e && e.message ? e.message : "연결 실패";
+  }
+
+  var syncPending = 0;
+  var syncFailed = false;
+
+  function setSync(kind, label) {
+    var chip = $("#syncChip");
+    if (!chip) return;
+    chip.dataset.state = kind;
+    $("#syncText").textContent = label;
+    chip.title = kind === "error" ? label + " — 눌러서 다시 불러오기" : "Supabase · " + label;
+  }
+
+  function syncBegin(label) {
+    syncPending++;
+    setSync("busy", label || "저장 중");
+  }
+
+  function syncDone(ok) {
+    syncPending = Math.max(0, syncPending - 1);
+    if (!ok) { syncFailed = true; setSync("error", "동기화 실패"); return; }
+    if (syncPending === 0 && !syncFailed) setSync("ok", "동기화됨");
+  }
+
+  // 서버 작업 실행기. fn은 supabase 쿼리(Promise)를 돌려준다.
+  function run(fn, failMsg) {
+    if (!sb) {
+      setSync("error", "연결 없음");
+      toast("서버에 연결되어 있지 않아 저장하지 못했어요 😥");
+      return Promise.resolve(false);
+    }
+    syncBegin();
+    return Promise.resolve().then(fn).then(function (res) {
+      if (res && res.error) throw res.error;
+      syncDone(true);
+      return true;
+    }).catch(function (err) {
+      if (window.console) console.error("[supabase]", err);
+      syncDone(false);
+      toast((failMsg || "저장하지 못했어요") + " 😥", "다시 불러오기", function () { loadAll(); }, 8000);
+      return false;
+    });
+  }
+
+  function rowOf(t) {
+    return { id: t.id, type: t.type, date: t.date, category: t.category, memo: t.memo, amount: t.amount };
+  }
+
+  function chunked(arr, size) {
+    var out = [];
+    for (var i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+    return out;
+  }
+
+  // 여러 묶음을 순차 실행하다가 에러가 나면 그 결과를 그대로 넘긴다.
+  function sequence(parts, task) {
+    return parts.reduce(function (p, part) {
+      return p.then(function (prev) {
+        if (prev && prev.error) return prev;
+        return task(part);
+      });
+    }, Promise.resolve(null));
+  }
+
+  function saveTxOne(t) {
+    return run(function () { return sb.from("transactions").upsert(rowOf(t)); }, "내역을 저장하지 못했어요");
+  }
+
+  function saveTxMany(list) {
+    if (!list.length) return Promise.resolve(true);
+    return run(function () {
+      return sequence(chunked(list.map(rowOf), 400), function (part) {
+        return sb.from("transactions").upsert(part);
+      });
+    }, "내역을 저장하지 못했어요");
+  }
+
+  function removeTxOne(id) {
+    return run(function () { return sb.from("transactions").delete().eq("id", id); }, "내역을 삭제하지 못했어요");
+  }
+
+  function removeTxAll() {
+    return run(function () { return sb.from("transactions").delete().neq("id", ""); }, "전체 삭제를 반영하지 못했어요");
+  }
+
+  function saveBudget(month, amount) {
+    return run(function () {
+      return sb.from("budgets").upsert({ month: month, amount: amount, updated_at: new Date().toISOString() });
+    }, "예산을 저장하지 못했어요");
+  }
+
+  function saveBudgetMany(map) {
+    var rows = Object.keys(map || {}).filter(function (k) {
+      return /^\d{4}-\d{2}$/.test(k) && isFinite(map[k]);
+    }).map(function (k) {
+      return { month: k, amount: Math.max(0, Math.round(Number(map[k]))) };
+    });
+    if (!rows.length) return Promise.resolve(true);
+    return run(function () {
+      return sequence(chunked(rows, 400), function (part) { return sb.from("budgets").upsert(part); });
+    }, "예산을 저장하지 못했어요");
+  }
+
+  function removeBudget(month) {
+    return run(function () { return sb.from("budgets").delete().eq("month", month); }, "예산을 삭제하지 못했어요");
+  }
+
+  function saveDefaultBudget(v) {
+    return run(function () {
+      return sb.from("settings").upsert({ id: 1, default_budget: v, updated_at: new Date().toISOString() });
+    }, "기본 예산을 저장하지 못했어요");
+  }
+
+  // PostgREST 기본 페이지 한도(1000건)를 넘어가도 전부 받아온다.
+  function fetchAllTx() {
+    var PAGE = 1000, all = [];
+    function page(from) {
+      return sb.from("transactions")
+        .select("id,type,date,category,memo,amount")
+        .order("created_at", { ascending: true })
+        .range(from, from + PAGE - 1)
+        .then(function (res) {
+          if (res.error) throw res.error;
+          var rows = res.data || [];
+          all = all.concat(rows);
+          if (rows.length < PAGE) return all;
+          return page(from + PAGE);
+        });
+    }
+    return page(0);
+  }
+
+  function loadAll() {
+    if (!sb) {
+      state.loading = false;
+      setSync("error", "연결 없음");
+      render();
+      toast("Supabase에 연결할 수 없어요" + (sbError ? " (" + sbError + ")" : ""), "새로고침", function () { location.reload(); }, 10000);
+      return Promise.resolve(false);
+    }
+    state.loading = true;
+    syncFailed = false;
+    setSync("busy", "불러오는 중");
+    render();
+
+    return Promise.all([
+      fetchAllTx(),
+      sb.from("budgets").select("month,amount"),
+      sb.from("settings").select("default_budget").eq("id", 1).maybeSingle()
+    ]).then(function (r) {
+      if (r[1].error) throw r[1].error;
+      if (r[2].error) throw r[2].error;
+
+      state.tx = normalize(r[0]);
+      var b = {};
+      (r[1].data || []).forEach(function (row) { b[row.month] = Number(row.amount) || 0; });
+      state.budgets = b;
+      state.settings.defaultBudget = (r[2].data && Number(r[2].data.default_budget)) || 0;
+
+      state.loading = false;
+      lastVals = {};
+      setSync("ok", "동기화됨");
+      render();
+      refreshMemoList();
+      return true;
+    }).catch(function (err) {
+      if (window.console) console.error("[supabase]", err);
+      state.loading = false;
+      syncFailed = true;
+      setSync("error", "불러오기 실패");
+      render();
+      toast("데이터를 불러오지 못했어요 😥", "다시 시도", function () { loadAll(); }, 10000);
+      return false;
+    });
+  }
+
+  // 예전 브라우저 저장분이 남아 있고 서버가 비어 있으면 한 번만 옮겨준다.
+  function migrateLocalOnce() {
+    if (!sb || safeGetRaw(K_MIGRATED)) return;
+    var old = normalize(safeGet(K_OLD_TX, []));
+    if (!old.length || state.tx.length) { safeSetRaw(K_MIGRATED, "1"); return; }
+
+    var ok = window.confirm(
+      "이 브라우저에 예전 방식으로 저장된 내역 " + old.length + "건이 남아 있어요.\n" +
+      "Supabase로 옮길까요?\n\n(원본은 브라우저에 그대로 남겨둡니다)"
+    );
+    if (!ok) { safeSetRaw(K_MIGRATED, "declined"); return; }
+
+    var oldBudgets = safeGet(K_OLD_BUD, {});
+    var oldDefault = legacyDefaultBudget;
+
+    state.tx = old;
+    if (oldBudgets && typeof oldBudgets === "object") state.budgets = oldBudgets;
+    state.settings.defaultBudget = oldDefault;
+    lastVals = {};
+    render();
+
+    Promise.all([
+      saveTxMany(old),
+      saveBudgetMany(state.budgets),
+      oldDefault ? saveDefaultBudget(oldDefault) : Promise.resolve(true)
+    ]).then(function (results) {
+      if (results.indexOf(false) === -1) {
+        safeSetRaw(K_MIGRATED, "1");
+        toast(old.length + "건을 Supabase로 옮겼어요 ☁️");
+      }
+    });
+  }
+
+  function savePrefs() { safeSet(K_PREF, prefs); }
 
   function viewKey() { return state.view.y + "-" + pad2(state.view.m + 1); }
   function keyOf(y, m) { return y + "-" + pad2(m + 1); }
@@ -1408,15 +1713,14 @@ kbd {
   }
 
   function initTheme() {
-    var saved = state.settings.theme;
-    var theme = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    var theme = prefs.theme || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
     applyTheme(theme);
   }
 
   $("#themeBtn").addEventListener("click", function () {
     var next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-    state.settings.theme = next;
-    saveSettings();
+    prefs.theme = next;
+    savePrefs();
     applyTheme(next);
     render({ soft: true });
   });
@@ -1612,17 +1916,21 @@ kbd {
   $("#budgetSave").addEventListener("click", function () {
     var v = parseInt(digits($("#budgetInput").value), 10) || 0;
     if (v <= 0) { toast("0원보다 큰 금액을 입력해 주세요"); return; }
-    state.budgets[viewKey()] = v;
+    var mk = viewKey();
+    state.budgets[mk] = v;
     state.settings.defaultBudget = v;
-    saveBudgets(); saveSettings();
+    saveBudget(mk, v);
+    saveDefaultBudget(v);
     closeBudgetEdit();
     render();
     toast("예산을 " + won(v) + "으로 설정했어요");
   });
   $("#budgetRemove").addEventListener("click", function () {
-    delete state.budgets[viewKey()];
+    var rk = viewKey();
+    delete state.budgets[rk];
     state.settings.defaultBudget = 0;
-    saveBudgets(); saveSettings();
+    removeBudget(rk);
+    saveDefaultBudget(0);
     closeBudgetEdit();
     render();
     toast("예산을 삭제했어요");
@@ -1842,7 +2150,9 @@ kbd {
     $("#listCount").textContent = list.length ? list.length + "건 · 지출 " + won(sum.expense) : "";
 
     if (!list.length) {
-      var msg = monthTx.length
+      var msg = state.loading
+        ? { ic: "☁️", t: "내역을 불러오는 중이에요", s: "잠시만 기다려 주세요" }
+        : monthTx.length
         ? { ic: "🔍", t: "조건에 맞는 내역이 없어요", s: "검색어나 필터를 바꿔보세요" }
         : { ic: "📭", t: "이번 달 내역이 없어요", s: "아래 + 버튼으로 첫 내역을 기록해 보세요" };
       area.innerHTML = '<div class="empty"><span class="e-ic">' + msg.ic + "</span><p>" + msg.t + '</p><p class="sub">' + msg.s + "</p></div>";
@@ -1924,11 +2234,11 @@ kbd {
     if (rowEl) rowEl.classList.add("removing");
     setTimeout(function () {
       state.tx.splice(idx, 1);
-      saveTx();
+      removeTxOne(removed.id);
       render();
       toast(catInfo(removed.type, removed.category).e + " " + won(removed.amount) + " 삭제됨", "실행취소", function () {
         state.tx.splice(Math.min(idx, state.tx.length), 0, removed);
-        saveTx();
+        saveTxOne(removed);
         render();
         flashRow(removed.id);
         toast("되돌렸어요");
@@ -2182,20 +2492,21 @@ kbd {
       amount: amount
     };
 
-    var id;
+    var id, saved;
     if (state.editingId) {
       for (var i = 0; i < state.tx.length; i++) {
-        if (state.tx[i].id === state.editingId) { Object.assign(state.tx[i], payload); id = state.tx[i].id; break; }
+        if (state.tx[i].id === state.editingId) { Object.assign(state.tx[i], payload); saved = state.tx[i]; id = saved.id; break; }
       }
       toast("수정했어요 ✨");
     } else {
       payload.id = uid();
       state.tx.push(payload);
+      saved = payload;
       id = payload.id;
       toast(catInfo(payload.type, payload.category).e + " " + won(amount) + " 기록 완료!");
     }
 
-    saveTx();
+    if (saved) saveTxOne(saved);
     var y = +payload.date.slice(0, 4), m = +payload.date.slice(5, 7) - 1;
     if (y !== state.view.y || m !== state.view.m) {
       state.view.y = y; state.view.m = m; state.dayFilter = null;
@@ -2235,7 +2546,8 @@ kbd {
     if (!b) return;
     menu.classList.remove("open");
     var act = b.dataset.act;
-    if (act === "csv") exportCSV();
+    if (act === "reload") loadAll();
+    else if (act === "csv") exportCSV();
     else if (act === "backup") exportJSON();
     else if (act === "restore") $("#fileInput").click();
     else if (act === "sample") addSample();
@@ -2292,25 +2604,27 @@ kbd {
         var replace = window.confirm(
           "백업 파일에서 " + incoming.length + "건을 찾았어요.\n\n[확인] 기존 데이터를 지우고 교체\n[취소] 기존 데이터에 합치기"
         );
+        var added = incoming;
         if (replace) {
           state.tx = incoming;
         } else {
           var have = {};
           state.tx.forEach(function (t) { have[t.id] = 1; });
-          incoming.forEach(function (t) { if (!have[t.id]) state.tx.push(t); });
+          added = incoming.filter(function (t) { return !have[t.id]; });
+          added.forEach(function (t) { state.tx.push(t); });
         }
         if (data.budgets && typeof data.budgets === "object") {
           state.budgets = replace ? data.budgets : Object.assign({}, data.budgets, state.budgets);
-          saveBudgets();
+          saveBudgetMany(state.budgets);
         }
         if (data.settings && typeof data.settings.defaultBudget === "number" && !state.settings.defaultBudget) {
           state.settings.defaultBudget = data.settings.defaultBudget;
-          saveSettings();
+          saveDefaultBudget(state.settings.defaultBudget);
         }
-        saveTx();
+        (replace ? removeTxAll().then(function (ok) { return ok ? saveTxMany(incoming) : false; }) : saveTxMany(added))
+          .then(function (ok) { if (ok) toast(incoming.length + "건을 불러왔어요 📥"); });
         lastVals = {};
         render();
-        toast(incoming.length + "건을 불러왔어요 📥");
       } catch (err) {
         toast("파일을 읽을 수 없어요 😥");
       }
@@ -2324,15 +2638,14 @@ kbd {
     if (!window.confirm("모든 내역 " + state.tx.length + "건을 삭제할까요?\n이 작업은 되돌릴 수 없어요.")) return;
     var backup = state.tx.slice();
     state.tx = [];
-    saveTx();
+    removeTxAll();
     lastVals = {};
     render();
     toast("전체 삭제했어요", "실행취소", function () {
       state.tx = backup;
-      saveTx();
+      saveTxMany(backup).then(function (ok) { if (ok) toast("복구했어요"); });
       lastVals = {};
       render();
-      toast("복구했어요");
     }, 8000);
   }
 
@@ -2348,35 +2661,33 @@ kbd {
       ["expense", "주거/관리비", "관리비", 90000, 160000],
       ["expense", "의료/건강", "약국", 6000, 24000]
     ];
-    var added = 0;
+    var fresh = [];
     for (var back = 2; back >= 0; back--) {
       var base = new Date(state.view.y, state.view.m - back, 1);
       var dim = new Date(base.getFullYear(), base.getMonth() + 1, 0).getDate();
-      state.tx.push({
+      fresh.push({
         id: uid(), type: "income", date: isoOf(new Date(base.getFullYear(), base.getMonth(), 25)),
         category: "급여", memo: "월급", amount: 2800000 + Math.floor(Math.random() * 6) * 50000
       });
-      added++;
       var count = 14 + Math.floor(Math.random() * 8);
       for (var i = 0; i < count; i++) {
         var s = samples[Math.floor(Math.random() * samples.length)];
         var day = 1 + Math.floor(Math.random() * dim);
-        state.tx.push({
+        fresh.push({
           id: uid(), type: s[0], date: isoOf(new Date(base.getFullYear(), base.getMonth(), day)),
           category: s[1], memo: s[2],
           amount: Math.round((s[3] + Math.random() * (s[4] - s[3])) / 100) * 100
         });
-        added++;
       }
     }
-    saveTx();
+    fresh.forEach(function (t) { state.tx.push(t); });
+    saveTxMany(fresh).then(function (ok) { if (ok) toast("샘플 " + fresh.length + "건을 추가했어요 ✨"); });
     if (!currentBudget()) {
       state.settings.defaultBudget = 1500000;
-      saveSettings();
+      saveDefaultBudget(1500000);
     }
     lastVals = {};
     render();
-    toast("샘플 " + added + "건을 추가했어요 ✨");
   }
 
   /* ==========================================================
@@ -2449,7 +2760,26 @@ kbd {
     $("#todayLabel").textContent = d.getFullYear() + "." + pad2(d.getMonth() + 1) + "." + pad2(d.getDate()) + " (" + DOW[d.getDay()] + ")";
   })();
   renderCatGrid();
-  render();
+
+  // 동기화 칩: 실패 상태일 때 눌러서 다시 불러오기
+  $("#syncChip").addEventListener("click", function () {
+    if (this.dataset.state === "error") loadAll();
+  });
+
+  // 다른 기기·탭에서 바뀐 내용을 반영하려고 탭이 다시 보일 때 재동기화한다.
+  var lastLoad = Date.now();
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") return;
+    if (syncPending > 0) return;
+    if (Date.now() - lastLoad < 30000) return;
+    lastLoad = Date.now();
+    loadAll();
+  });
+
+  loadAll().then(function () {
+    lastLoad = Date.now();
+    migrateLocalOnce();
+  });
 })();
 </script>
 </body>
